@@ -1,0 +1,2054 @@
+commit 9ac2bb30f4c87336832eec548a5d1180a2008fc5
+Author: -LAN- <laipz8200@outlook.com>
+Date:   Fri Nov 1 15:51:22 2024 +0800
+
+    Feat/add-remote-file-upload-api (#9906)
+
+diff --git a/api/controllers/common/errors.py b/api/controllers/common/errors.py
+new file mode 100644
+index 0000000000..c71f1ce5a3
+--- /dev/null
++++ b/api/controllers/common/errors.py
+@@ -0,0 +1,6 @@
++from werkzeug.exceptions import HTTPException
++
++
++class FilenameNotExistsError(HTTPException):
++    code = 400
++    description = "The specified filename does not exist."
+diff --git a/api/controllers/common/helpers.py b/api/controllers/common/helpers.py
+new file mode 100644
+index 0000000000..ed24b265ef
+--- /dev/null
++++ b/api/controllers/common/helpers.py
+@@ -0,0 +1,58 @@
++import mimetypes
++import os
++import re
++import urllib.parse
++from uuid import uuid4
++
++import httpx
++from pydantic import BaseModel
++
++
++class FileInfo(BaseModel):
++    filename: str
++    extension: str
++    mimetype: str
++    size: int
++
++
++def guess_file_info_from_response(response: httpx.Response):
++    url = str(response.url)
++    # Try to extract filename from URL
++    parsed_url = urllib.parse.urlparse(url)
++    url_path = parsed_url.path
++    filename = os.path.basename(url_path)
++
++    # If filename couldn't be extracted, use Content-Disposition header
++    if not filename:
++        content_disposition = response.headers.get("Content-Disposition")
++        if content_disposition:
++            filename_match = re.search(r'filename="?(.+)"?', content_disposition)
++            if filename_match:
++                filename = filename_match.group(1)
++
++    # If still no filename, generate a unique one
++    if not filename:
++        unique_name = str(uuid4())
++        filename = f"{unique_name}"
++
++    # Guess MIME type from filename first, then URL
++    mimetype, _ = mimetypes.guess_type(filename)
++    if mimetype is None:
++        mimetype, _ = mimetypes.guess_type(url)
++    if mimetype is None:
++        # If guessing fails, use Content-Type from response headers
++        mimetype = response.headers.get("Content-Type", "application/octet-stream")
++
++    extension = os.path.splitext(filename)[1]
++
++    # Ensure filename has an extension
++    if not extension:
++        extension = mimetypes.guess_extension(mimetype) or ".bin"
++        filename = f"{filename}{extension}"
++
++    return FileInfo(
++        filename=filename,
++        extension=extension,
++        mimetype=mimetype,
++        size=int(response.headers.get("Content-Length", -1)),
++    )
+diff --git a/api/controllers/console/__init__.py b/api/controllers/console/__init__.py
+index c7282fcf14..8a5c2e5b8f 100644
+--- a/api/controllers/console/__init__.py
++++ b/api/controllers/console/__init__.py
+@@ -2,9 +2,21 @@ from flask import Blueprint
+ 
+ from libs.external_api import ExternalApi
+ 
++from .files import FileApi, FilePreviewApi, FileSupportTypeApi
++from .remote_files import RemoteFileInfoApi, RemoteFileUploadApi
++
+ bp = Blueprint("console", __name__, url_prefix="/console/api")
+ api = ExternalApi(bp)
+ 
++# File
++api.add_resource(FileApi, "/files/upload")
++api.add_resource(FilePreviewApi, "/files/<uuid:file_id>/preview")
++api.add_resource(FileSupportTypeApi, "/files/support-type")
++
++# Remote files
++api.add_resource(RemoteFileInfoApi, "/remote-files/<path:url>")
++api.add_resource(RemoteFileUploadApi, "/remote-files/upload")
++
+ # Import other controllers
+ from . import admin, apikey, extension, feature, ping, setup, version
+ 
+@@ -43,7 +55,6 @@ from .datasets import (
+     datasets_document,
+     datasets_segments,
+     external,
+-    file,
+     hit_testing,
+     website,
+ )
+diff --git a/api/controllers/console/apikey.py b/api/controllers/console/apikey.py
+index 35ac42a14c..9537708689 100644
+--- a/api/controllers/console/apikey.py
++++ b/api/controllers/console/apikey.py
+@@ -10,8 +10,7 @@ from models.dataset import Dataset
+ from models.model import ApiToken, App
+ 
+ from . import api
+-from .setup import setup_required
+-from .wraps import account_initialization_required
++from .wraps import account_initialization_required, setup_required
+ 
+ api_key_fields = {
+     "id": fields.String,
+diff --git a/api/controllers/console/app/advanced_prompt_template.py b/api/controllers/console/app/advanced_prompt_template.py
+index e7346bdf1d..c228743fa5 100644
+--- a/api/controllers/console/app/advanced_prompt_template.py
++++ b/api/controllers/console/app/advanced_prompt_template.py
+@@ -1,8 +1,7 @@
+ from flask_restful import Resource, reqparse
+ 
+ from controllers.console import api
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from libs.login import login_required
+ from services.advanced_prompt_template_service import AdvancedPromptTemplateService
+ 
+diff --git a/api/controllers/console/app/agent.py b/api/controllers/console/app/agent.py
+index 51899da705..d433415894 100644
+--- a/api/controllers/console/app/agent.py
++++ b/api/controllers/console/app/agent.py
+@@ -2,8 +2,7 @@ from flask_restful import Resource, reqparse
+ 
+ from controllers.console import api
+ from controllers.console.app.wraps import get_app_model
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from libs.helper import uuid_value
+ from libs.login import login_required
+ from models.model import AppMode
+diff --git a/api/controllers/console/app/annotation.py b/api/controllers/console/app/annotation.py
+index 1ea1c82679..fd05cbc19b 100644
+--- a/api/controllers/console/app/annotation.py
++++ b/api/controllers/console/app/annotation.py
+@@ -6,8 +6,11 @@ from werkzeug.exceptions import Forbidden
+ from controllers.console import api
+ from controllers.console.app.error import NoFileUploadedError
+ from controllers.console.datasets.error import TooManyFilesError
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required, cloud_edition_billing_resource_check
++from controllers.console.wraps import (
++    account_initialization_required,
++    cloud_edition_billing_resource_check,
++    setup_required,
++)
+ from extensions.ext_redis import redis_client
+ from fields.annotation_fields import (
+     annotation_fields,
+diff --git a/api/controllers/console/app/app.py b/api/controllers/console/app/app.py
+index 1b46a3a7d3..36338cbd8a 100644
+--- a/api/controllers/console/app/app.py
++++ b/api/controllers/console/app/app.py
+@@ -6,8 +6,11 @@ from werkzeug.exceptions import BadRequest, Forbidden, abort
+ 
+ from controllers.console import api
+ from controllers.console.app.wraps import get_app_model
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required, cloud_edition_billing_resource_check
++from controllers.console.wraps import (
++    account_initialization_required,
++    cloud_edition_billing_resource_check,
++    setup_required,
++)
+ from core.ops.ops_trace_manager import OpsTraceManager
+ from fields.app_fields import (
+     app_detail_fields,
+diff --git a/api/controllers/console/app/audio.py b/api/controllers/console/app/audio.py
+index c1ef05a488..112446613f 100644
+--- a/api/controllers/console/app/audio.py
++++ b/api/controllers/console/app/audio.py
+@@ -18,8 +18,7 @@ from controllers.console.app.error import (
+     UnsupportedAudioTypeError,
+ )
+ from controllers.console.app.wraps import get_app_model
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from core.errors.error import ModelCurrentlyNotSupportError, ProviderTokenNotInitError, QuotaExceededError
+ from core.model_runtime.errors.invoke import InvokeError
+ from libs.login import login_required
+diff --git a/api/controllers/console/app/completion.py b/api/controllers/console/app/completion.py
+index d3296d3dff..9896fcaab8 100644
+--- a/api/controllers/console/app/completion.py
++++ b/api/controllers/console/app/completion.py
+@@ -15,8 +15,7 @@ from controllers.console.app.error import (
+     ProviderQuotaExceededError,
+ )
+ from controllers.console.app.wraps import get_app_model
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from controllers.web.error import InvokeRateLimitError as InvokeRateLimitHttpError
+ from core.app.apps.base_app_queue_manager import AppQueueManager
+ from core.app.entities.app_invoke_entities import InvokeFrom
+diff --git a/api/controllers/console/app/conversation.py b/api/controllers/console/app/conversation.py
+index b60a424d98..7b78f622b9 100644
+--- a/api/controllers/console/app/conversation.py
++++ b/api/controllers/console/app/conversation.py
+@@ -10,8 +10,7 @@ from werkzeug.exceptions import Forbidden, NotFound
+ 
+ from controllers.console import api
+ from controllers.console.app.wraps import get_app_model
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from core.app.entities.app_invoke_entities import InvokeFrom
+ from extensions.ext_database import db
+ from fields.conversation_fields import (
+diff --git a/api/controllers/console/app/conversation_variables.py b/api/controllers/console/app/conversation_variables.py
+index 23b234dac9..d49f433ba1 100644
+--- a/api/controllers/console/app/conversation_variables.py
++++ b/api/controllers/console/app/conversation_variables.py
+@@ -4,8 +4,7 @@ from sqlalchemy.orm import Session
+ 
+ from controllers.console import api
+ from controllers.console.app.wraps import get_app_model
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from extensions.ext_database import db
+ from fields.conversation_variable_fields import paginated_conversation_variable_fields
+ from libs.login import login_required
+diff --git a/api/controllers/console/app/generator.py b/api/controllers/console/app/generator.py
+index 7108759b0b..9c3cbe4e3e 100644
+--- a/api/controllers/console/app/generator.py
++++ b/api/controllers/console/app/generator.py
+@@ -10,8 +10,7 @@ from controllers.console.app.error import (
+     ProviderNotInitializeError,
+     ProviderQuotaExceededError,
+ )
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from core.errors.error import ModelCurrentlyNotSupportError, ProviderTokenNotInitError, QuotaExceededError
+ from core.llm_generator.llm_generator import LLMGenerator
+ from core.model_runtime.errors.invoke import InvokeError
+diff --git a/api/controllers/console/app/message.py b/api/controllers/console/app/message.py
+index fe06201982..b7a4c31a15 100644
+--- a/api/controllers/console/app/message.py
++++ b/api/controllers/console/app/message.py
+@@ -14,8 +14,11 @@ from controllers.console.app.error import (
+ )
+ from controllers.console.app.wraps import get_app_model
+ from controllers.console.explore.error import AppSuggestedQuestionsAfterAnswerDisabledError
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required, cloud_edition_billing_resource_check
++from controllers.console.wraps import (
++    account_initialization_required,
++    cloud_edition_billing_resource_check,
++    setup_required,
++)
+ from core.app.entities.app_invoke_entities import InvokeFrom
+ from core.errors.error import ModelCurrentlyNotSupportError, ProviderTokenNotInitError, QuotaExceededError
+ from core.model_runtime.errors.invoke import InvokeError
+diff --git a/api/controllers/console/app/model_config.py b/api/controllers/console/app/model_config.py
+index f5068a4cd8..8ba195f5a5 100644
+--- a/api/controllers/console/app/model_config.py
++++ b/api/controllers/console/app/model_config.py
+@@ -6,8 +6,7 @@ from flask_restful import Resource
+ 
+ from controllers.console import api
+ from controllers.console.app.wraps import get_app_model
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from core.agent.entities import AgentToolEntity
+ from core.tools.tool_manager import ToolManager
+ from core.tools.utils.configuration import ToolParameterConfigurationManager
+diff --git a/api/controllers/console/app/ops_trace.py b/api/controllers/console/app/ops_trace.py
+index 374bd2b815..47b58396a1 100644
+--- a/api/controllers/console/app/ops_trace.py
++++ b/api/controllers/console/app/ops_trace.py
+@@ -2,8 +2,7 @@ from flask_restful import Resource, reqparse
+ 
+ from controllers.console import api
+ from controllers.console.app.error import TracingConfigCheckError, TracingConfigIsExist, TracingConfigNotExist
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from libs.login import login_required
+ from services.ops_service import OpsService
+ 
+diff --git a/api/controllers/console/app/site.py b/api/controllers/console/app/site.py
+index 115a832da9..2f5645852f 100644
+--- a/api/controllers/console/app/site.py
++++ b/api/controllers/console/app/site.py
+@@ -7,8 +7,7 @@ from werkzeug.exceptions import Forbidden, NotFound
+ from constants.languages import supported_language
+ from controllers.console import api
+ from controllers.console.app.wraps import get_app_model
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from extensions.ext_database import db
+ from fields.app_fields import app_site_fields
+ from libs.login import login_required
+diff --git a/api/controllers/console/app/statistic.py b/api/controllers/console/app/statistic.py
+index 3ef442812d..db5e282409 100644
+--- a/api/controllers/console/app/statistic.py
++++ b/api/controllers/console/app/statistic.py
+@@ -8,8 +8,7 @@ from flask_restful import Resource, reqparse
+ 
+ from controllers.console import api
+ from controllers.console.app.wraps import get_app_model
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from extensions.ext_database import db
+ from libs.helper import DatetimeString
+ from libs.login import login_required
+diff --git a/api/controllers/console/app/workflow.py b/api/controllers/console/app/workflow.py
+index a8f601aeee..f7027fb226 100644
+--- a/api/controllers/console/app/workflow.py
++++ b/api/controllers/console/app/workflow.py
+@@ -9,8 +9,7 @@ import services
+ from controllers.console import api
+ from controllers.console.app.error import ConversationCompletedError, DraftWorkflowNotExist, DraftWorkflowNotSync
+ from controllers.console.app.wraps import get_app_model
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from core.app.apps.base_app_queue_manager import AppQueueManager
+ from core.app.entities.app_invoke_entities import InvokeFrom
+ from factories import variable_factory
+diff --git a/api/controllers/console/app/workflow_app_log.py b/api/controllers/console/app/workflow_app_log.py
+index 629b7a8bf4..2940556f84 100644
+--- a/api/controllers/console/app/workflow_app_log.py
++++ b/api/controllers/console/app/workflow_app_log.py
+@@ -3,8 +3,7 @@ from flask_restful.inputs import int_range
+ 
+ from controllers.console import api
+ from controllers.console.app.wraps import get_app_model
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from fields.workflow_app_log_fields import workflow_app_log_pagination_fields
+ from libs.login import login_required
+ from models import App
+diff --git a/api/controllers/console/app/workflow_run.py b/api/controllers/console/app/workflow_run.py
+index 5824ead9c3..08ab61bbb9 100644
+--- a/api/controllers/console/app/workflow_run.py
++++ b/api/controllers/console/app/workflow_run.py
+@@ -3,8 +3,7 @@ from flask_restful.inputs import int_range
+ 
+ from controllers.console import api
+ from controllers.console.app.wraps import get_app_model
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from fields.workflow_run_fields import (
+     advanced_chat_workflow_run_pagination_fields,
+     workflow_run_detail_fields,
+diff --git a/api/controllers/console/app/workflow_statistic.py b/api/controllers/console/app/workflow_statistic.py
+index f46af0f1ca..6c7c73707b 100644
+--- a/api/controllers/console/app/workflow_statistic.py
++++ b/api/controllers/console/app/workflow_statistic.py
+@@ -8,8 +8,7 @@ from flask_restful import Resource, reqparse
+ 
+ from controllers.console import api
+ from controllers.console.app.wraps import get_app_model
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from extensions.ext_database import db
+ from libs.helper import DatetimeString
+ from libs.login import login_required
+diff --git a/api/controllers/console/auth/data_source_bearer_auth.py b/api/controllers/console/auth/data_source_bearer_auth.py
+index 50db6eebc1..465c44e9b6 100644
+--- a/api/controllers/console/auth/data_source_bearer_auth.py
++++ b/api/controllers/console/auth/data_source_bearer_auth.py
+@@ -7,8 +7,7 @@ from controllers.console.auth.error import ApiKeyAuthFailedError
+ from libs.login import login_required
+ from services.auth.api_key_auth_service import ApiKeyAuthService
+ 
+-from ..setup import setup_required
+-from ..wraps import account_initialization_required
++from ..wraps import account_initialization_required, setup_required
+ 
+ 
+ class ApiKeyAuthDataSource(Resource):
+diff --git a/api/controllers/console/auth/data_source_oauth.py b/api/controllers/console/auth/data_source_oauth.py
+index fd31e5ccc3..3c3f45260a 100644
+--- a/api/controllers/console/auth/data_source_oauth.py
++++ b/api/controllers/console/auth/data_source_oauth.py
+@@ -11,8 +11,7 @@ from controllers.console import api
+ from libs.login import login_required
+ from libs.oauth_data_source import NotionOAuth
+ 
+-from ..setup import setup_required
+-from ..wraps import account_initialization_required
++from ..wraps import account_initialization_required, setup_required
+ 
+ 
+ def get_oauth_providers():
+diff --git a/api/controllers/console/auth/forgot_password.py b/api/controllers/console/auth/forgot_password.py
+index 7fea610610..735edae5f6 100644
+--- a/api/controllers/console/auth/forgot_password.py
++++ b/api/controllers/console/auth/forgot_password.py
+@@ -13,7 +13,7 @@ from controllers.console.auth.error import (
+     PasswordMismatchError,
+ )
+ from controllers.console.error import EmailSendIpLimitError, NotAllowedRegister
+-from controllers.console.setup import setup_required
++from controllers.console.wraps import setup_required
+ from events.tenant_event import tenant_was_created
+ from extensions.ext_database import db
+ from libs.helper import email, extract_remote_ip
+diff --git a/api/controllers/console/auth/login.py b/api/controllers/console/auth/login.py
+index 6c795f95b6..e2e8f84920 100644
+--- a/api/controllers/console/auth/login.py
++++ b/api/controllers/console/auth/login.py
+@@ -20,7 +20,7 @@ from controllers.console.error import (
+     NotAllowedCreateWorkspace,
+     NotAllowedRegister,
+ )
+-from controllers.console.setup import setup_required
++from controllers.console.wraps import setup_required
+ from events.tenant_event import tenant_was_created
+ from libs.helper import email, extract_remote_ip
+ from libs.password import valid_password
+diff --git a/api/controllers/console/billing/billing.py b/api/controllers/console/billing/billing.py
+index 9a1d914869..4b0c82ae6c 100644
+--- a/api/controllers/console/billing/billing.py
++++ b/api/controllers/console/billing/billing.py
+@@ -2,8 +2,7 @@ from flask_login import current_user
+ from flask_restful import Resource, reqparse
+ 
+ from controllers.console import api
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required, only_edition_cloud
++from controllers.console.wraps import account_initialization_required, only_edition_cloud, setup_required
+ from libs.login import login_required
+ from services.billing_service import BillingService
+ 
+diff --git a/api/controllers/console/datasets/data_source.py b/api/controllers/console/datasets/data_source.py
+index a2c9760782..ef1e87905a 100644
+--- a/api/controllers/console/datasets/data_source.py
++++ b/api/controllers/console/datasets/data_source.py
+@@ -7,8 +7,7 @@ from flask_restful import Resource, marshal_with, reqparse
+ from werkzeug.exceptions import NotFound
+ 
+ from controllers.console import api
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from core.indexing_runner import IndexingRunner
+ from core.rag.extractor.entity.extract_setting import ExtractSetting
+ from core.rag.extractor.notion_extractor import NotionExtractor
+diff --git a/api/controllers/console/datasets/datasets.py b/api/controllers/console/datasets/datasets.py
+index 4f4d186edd..07ef0ce3e5 100644
+--- a/api/controllers/console/datasets/datasets.py
++++ b/api/controllers/console/datasets/datasets.py
+@@ -10,8 +10,7 @@ from controllers.console import api
+ from controllers.console.apikey import api_key_fields, api_key_list
+ from controllers.console.app.error import ProviderNotInitializeError
+ from controllers.console.datasets.error import DatasetInUseError, DatasetNameDuplicateError, IndexingEstimateError
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from core.errors.error import LLMBadRequestError, ProviderTokenNotInitError
+ from core.indexing_runner import IndexingRunner
+ from core.model_runtime.entities.model_entities import ModelType
+diff --git a/api/controllers/console/datasets/datasets_document.py b/api/controllers/console/datasets/datasets_document.py
+index cdabac491e..8e784dc70b 100644
+--- a/api/controllers/console/datasets/datasets_document.py
++++ b/api/controllers/console/datasets/datasets_document.py
+@@ -24,8 +24,11 @@ from controllers.console.datasets.error import (
+     InvalidActionError,
+     InvalidMetadataError,
+ )
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required, cloud_edition_billing_resource_check
++from controllers.console.wraps import (
++    account_initialization_required,
++    cloud_edition_billing_resource_check,
++    setup_required,
++)
+ from core.errors.error import (
+     LLMBadRequestError,
+     ModelCurrentlyNotSupportError,
+diff --git a/api/controllers/console/datasets/datasets_segments.py b/api/controllers/console/datasets/datasets_segments.py
+index 08ea414288..5d8d664e41 100644
+--- a/api/controllers/console/datasets/datasets_segments.py
++++ b/api/controllers/console/datasets/datasets_segments.py
+@@ -11,11 +11,11 @@ import services
+ from controllers.console import api
+ from controllers.console.app.error import ProviderNotInitializeError
+ from controllers.console.datasets.error import InvalidActionError, NoFileUploadedError, TooManyFilesError
+-from controllers.console.setup import setup_required
+ from controllers.console.wraps import (
+     account_initialization_required,
+     cloud_edition_billing_knowledge_limit_check,
+     cloud_edition_billing_resource_check,
++    setup_required,
+ )
+ from core.errors.error import LLMBadRequestError, ProviderTokenNotInitError
+ from core.model_manager import ModelManager
+diff --git a/api/controllers/console/datasets/external.py b/api/controllers/console/datasets/external.py
+index 2dc054cfbd..bc6e3687c1 100644
+--- a/api/controllers/console/datasets/external.py
++++ b/api/controllers/console/datasets/external.py
+@@ -6,8 +6,7 @@ from werkzeug.exceptions import Forbidden, InternalServerError, NotFound
+ import services
+ from controllers.console import api
+ from controllers.console.datasets.error import DatasetNameDuplicateError
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from fields.dataset_fields import dataset_detail_fields
+ from libs.login import login_required
+ from services.dataset_service import DatasetService
+diff --git a/api/controllers/console/datasets/hit_testing.py b/api/controllers/console/datasets/hit_testing.py
+index 5c9bcef84c..495f511275 100644
+--- a/api/controllers/console/datasets/hit_testing.py
++++ b/api/controllers/console/datasets/hit_testing.py
+@@ -2,8 +2,7 @@ from flask_restful import Resource
+ 
+ from controllers.console import api
+ from controllers.console.datasets.hit_testing_base import DatasetsHitTestingBase
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from libs.login import login_required
+ 
+ 
+diff --git a/api/controllers/console/datasets/website.py b/api/controllers/console/datasets/website.py
+index e80ce17c68..9127c8af45 100644
+--- a/api/controllers/console/datasets/website.py
++++ b/api/controllers/console/datasets/website.py
+@@ -2,8 +2,7 @@ from flask_restful import Resource, reqparse
+ 
+ from controllers.console import api
+ from controllers.console.datasets.error import WebsiteCrawlError
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from libs.login import login_required
+ from services.website_service import WebsiteService
+ 
+diff --git a/api/controllers/console/extension.py b/api/controllers/console/extension.py
+index 5d6a8bf152..4ac0aa497e 100644
+--- a/api/controllers/console/extension.py
++++ b/api/controllers/console/extension.py
+@@ -3,8 +3,7 @@ from flask_restful import Resource, marshal_with, reqparse
+ 
+ from constants import HIDDEN_VALUE
+ from controllers.console import api
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from fields.api_based_extension_fields import api_based_extension_fields
+ from libs.login import login_required
+ from models.api_based_extension import APIBasedExtension
+diff --git a/api/controllers/console/feature.py b/api/controllers/console/feature.py
+index f0482f749d..70ab4ff865 100644
+--- a/api/controllers/console/feature.py
++++ b/api/controllers/console/feature.py
+@@ -5,8 +5,7 @@ from libs.login import login_required
+ from services.feature_service import FeatureService
+ 
+ from . import api
+-from .setup import setup_required
+-from .wraps import account_initialization_required, cloud_utm_record
++from .wraps import account_initialization_required, cloud_utm_record, setup_required
+ 
+ 
+ class FeatureApi(Resource):
+diff --git a/api/controllers/console/datasets/file.py b/api/controllers/console/files/__init__.py
+similarity index 57%
+rename from api/controllers/console/datasets/file.py
+rename to api/controllers/console/files/__init__.py
+index 17d2879875..69ee7eaabd 100644
+--- a/api/controllers/console/datasets/file.py
++++ b/api/controllers/console/files/__init__.py
+@@ -1,25 +1,26 @@
+-import urllib.parse
+-
+ from flask import request
+ from flask_login import current_user
+-from flask_restful import Resource, marshal_with, reqparse
++from flask_restful import Resource, marshal_with
+ 
+ import services
+ from configs import dify_config
+ from constants import DOCUMENT_EXTENSIONS
+-from controllers.console import api
+-from controllers.console.datasets.error import (
++from controllers.common.errors import FilenameNotExistsError
++from controllers.console.wraps import (
++    account_initialization_required,
++    cloud_edition_billing_resource_check,
++    setup_required,
++)
++from fields.file_fields import file_fields, upload_config_fields
++from libs.login import login_required
++from services.file_service import FileService
++
++from .errors import (
+     FileTooLargeError,
+     NoFileUploadedError,
+     TooManyFilesError,
+     UnsupportedFileTypeError,
+ )
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required, cloud_edition_billing_resource_check
+-from core.helper import ssrf_proxy
+-from fields.file_fields import file_fields, remote_file_info_fields, upload_config_fields
+-from libs.login import login_required
+-from services.file_service import FileService
+ 
+ PREVIEW_WORDS_LIMIT = 3000
+ 
+@@ -44,21 +45,29 @@ class FileApi(Resource):
+     @marshal_with(file_fields)
+     @cloud_edition_billing_resource_check("documents")
+     def post(self):
+-        # get file from request
+         file = request.files["file"]
++        source = request.form.get("source")
+ 
+-        parser = reqparse.RequestParser()
+-        parser.add_argument("source", type=str, required=False, location="args")
+-        source = parser.parse_args().get("source")
+-
+-        # check file
+         if "file" not in request.files:
+             raise NoFileUploadedError()
+ 
+         if len(request.files) > 1:
+             raise TooManyFilesError()
++
++        if not file.filename:
++            raise FilenameNotExistsError
++
++        if source not in ("datasets", None):
++            source = None
++
+         try:
+-            upload_file = FileService.upload_file(file=file, user=current_user, source=source)
++            upload_file = FileService.upload_file(
++                filename=file.filename,
++                content=file.read(),
++                mimetype=file.mimetype,
++                user=current_user,
++                source=source,
++            )
+         except services.errors.file.FileTooLargeError as file_too_large_error:
+             raise FileTooLargeError(file_too_large_error.description)
+         except services.errors.file.UnsupportedFileTypeError:
+@@ -83,23 +92,3 @@ class FileSupportTypeApi(Resource):
+     @account_initialization_required
+     def get(self):
+         return {"allowed_extensions": DOCUMENT_EXTENSIONS}
+-
+-
+-class RemoteFileInfoApi(Resource):
+-    @marshal_with(remote_file_info_fields)
+-    def get(self, url):
+-        decoded_url = urllib.parse.unquote(url)
+-        try:
+-            response = ssrf_proxy.head(decoded_url)
+-            return {
+-                "file_type": response.headers.get("Content-Type", "application/octet-stream"),
+-                "file_length": int(response.headers.get("Content-Length", 0)),
+-            }
+-        except Exception as e:
+-            return {"error": str(e)}, 400
+-
+-
+-api.add_resource(FileApi, "/files/upload")
+-api.add_resource(FilePreviewApi, "/files/<uuid:file_id>/preview")
+-api.add_resource(FileSupportTypeApi, "/files/support-type")
+-api.add_resource(RemoteFileInfoApi, "/remote-files/<path:url>")
+diff --git a/api/controllers/console/files/errors.py b/api/controllers/console/files/errors.py
+new file mode 100644
+index 0000000000..1654ef2cf4
+--- /dev/null
++++ b/api/controllers/console/files/errors.py
+@@ -0,0 +1,25 @@
++from libs.exception import BaseHTTPException
++
++
++class FileTooLargeError(BaseHTTPException):
++    error_code = "file_too_large"
++    description = "File size exceeded. {message}"
++    code = 413
++
++
++class UnsupportedFileTypeError(BaseHTTPException):
++    error_code = "unsupported_file_type"
++    description = "File type not allowed."
++    code = 415
++
++
++class TooManyFilesError(BaseHTTPException):
++    error_code = "too_many_files"
++    description = "Only one file is allowed."
++    code = 400
++
++
++class NoFileUploadedError(BaseHTTPException):
++    error_code = "no_file_uploaded"
++    description = "Please upload your file."
++    code = 400
+diff --git a/api/controllers/console/remote_files.py b/api/controllers/console/remote_files.py
+new file mode 100644
+index 0000000000..42d6e25416
+--- /dev/null
++++ b/api/controllers/console/remote_files.py
+@@ -0,0 +1,71 @@
++import urllib.parse
++from typing import cast
++
++from flask_login import current_user
++from flask_restful import Resource, marshal_with, reqparse
++
++from controllers.common import helpers
++from core.file import helpers as file_helpers
++from core.helper import ssrf_proxy
++from fields.file_fields import file_fields_with_signed_url, remote_file_info_fields
++from models.account import Account
++from services.file_service import FileService
++
++
++class RemoteFileInfoApi(Resource):
++    @marshal_with(remote_file_info_fields)
++    def get(self, url):
++        decoded_url = urllib.parse.unquote(url)
++        try:
++            response = ssrf_proxy.head(decoded_url)
++            return {
++                "file_type": response.headers.get("Content-Type", "application/octet-stream"),
++                "file_length": int(response.headers.get("Content-Length", 0)),
++            }
++        except Exception as e:
++            return {"error": str(e)}, 400
++
++
++class RemoteFileUploadApi(Resource):
++    @marshal_with(file_fields_with_signed_url)
++    def post(self):
++        parser = reqparse.RequestParser()
++        parser.add_argument("url", type=str, required=True, help="URL is required")
++        args = parser.parse_args()
++
++        url = args["url"]
++
++        response = ssrf_proxy.head(url)
++        response.raise_for_status()
++
++        file_info = helpers.guess_file_info_from_response(response)
++
++        if not FileService.is_file_size_within_limit(extension=file_info.extension, file_size=file_info.size):
++            return {"error": "File size exceeded"}, 400
++
++        response = ssrf_proxy.get(url)
++        response.raise_for_status()
++        content = response.content
++
++        try:
++            user = cast(Account, current_user)
++            upload_file = FileService.upload_file(
++                filename=file_info.filename,
++                content=content,
++                mimetype=file_info.mimetype,
++                user=user,
++                source_url=url,
++            )
++        except Exception as e:
++            return {"error": str(e)}, 400
++
++        return {
++            "id": upload_file.id,
++            "name": upload_file.name,
++            "size": upload_file.size,
++            "extension": upload_file.extension,
++            "url": file_helpers.get_signed_file_url(upload_file_id=upload_file.id),
++            "mime_type": upload_file.mime_type,
++            "created_by": upload_file.created_by,
++            "created_at": upload_file.created_at,
++        }, 201
+diff --git a/api/controllers/console/setup.py b/api/controllers/console/setup.py
+index 15a4af118b..e0b728d977 100644
+--- a/api/controllers/console/setup.py
++++ b/api/controllers/console/setup.py
+@@ -1,5 +1,3 @@
+-from functools import wraps
+-
+ from flask import request
+ from flask_restful import Resource, reqparse
+ 
+@@ -10,7 +8,7 @@ from models.model import DifySetup
+ from services.account_service import RegisterService, TenantService
+ 
+ from . import api
+-from .error import AlreadySetupError, NotInitValidateError, NotSetupError
++from .error import AlreadySetupError, NotInitValidateError
+ from .init_validate import get_init_validate_status
+ from .wraps import only_edition_self_hosted
+ 
+@@ -52,26 +50,10 @@ class SetupApi(Resource):
+         return {"result": "success"}, 201
+ 
+ 
+-def setup_required(view):
+-    @wraps(view)
+-    def decorated(*args, **kwargs):
+-        # check setup
+-        if not get_init_validate_status():
+-            raise NotInitValidateError()
+-
+-        elif not get_setup_status():
+-            raise NotSetupError()
+-
+-        return view(*args, **kwargs)
+-
+-    return decorated
+-
+-
+ def get_setup_status():
+     if dify_config.EDITION == "SELF_HOSTED":
+         return DifySetup.query.first()
+-    else:
+-        return True
++    return True
+ 
+ 
+ api.add_resource(SetupApi, "/setup")
+diff --git a/api/controllers/console/tag/tags.py b/api/controllers/console/tag/tags.py
+index de30547e93..ccd3293a62 100644
+--- a/api/controllers/console/tag/tags.py
++++ b/api/controllers/console/tag/tags.py
+@@ -4,8 +4,7 @@ from flask_restful import Resource, marshal_with, reqparse
+ from werkzeug.exceptions import Forbidden
+ 
+ from controllers.console import api
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from fields.tag_fields import tag_fields
+ from libs.login import login_required
+ from models.model import Tag
+diff --git a/api/controllers/console/workspace/account.py b/api/controllers/console/workspace/account.py
+index 97f5625726..aabc417759 100644
+--- a/api/controllers/console/workspace/account.py
++++ b/api/controllers/console/workspace/account.py
+@@ -8,14 +8,13 @@ from flask_restful import Resource, fields, marshal_with, reqparse
+ from configs import dify_config
+ from constants.languages import supported_language
+ from controllers.console import api
+-from controllers.console.setup import setup_required
+ from controllers.console.workspace.error import (
+     AccountAlreadyInitedError,
+     CurrentPasswordIncorrectError,
+     InvalidInvitationCodeError,
+     RepeatPasswordNotMatchError,
+ )
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from extensions.ext_database import db
+ from fields.member_fields import account_fields
+ from libs.helper import TimestampField, timezone
+diff --git a/api/controllers/console/workspace/load_balancing_config.py b/api/controllers/console/workspace/load_balancing_config.py
+index 771a866624..d2b2092b75 100644
+--- a/api/controllers/console/workspace/load_balancing_config.py
++++ b/api/controllers/console/workspace/load_balancing_config.py
+@@ -2,8 +2,7 @@ from flask_restful import Resource, reqparse
+ from werkzeug.exceptions import Forbidden
+ 
+ from controllers.console import api
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from core.model_runtime.entities.model_entities import ModelType
+ from core.model_runtime.errors.validate import CredentialsValidateFailedError
+ from libs.login import current_user, login_required
+diff --git a/api/controllers/console/workspace/members.py b/api/controllers/console/workspace/members.py
+index 3e87bebf59..8f694c65e0 100644
+--- a/api/controllers/console/workspace/members.py
++++ b/api/controllers/console/workspace/members.py
+@@ -4,8 +4,11 @@ from flask_restful import Resource, abort, marshal_with, reqparse
+ import services
+ from configs import dify_config
+ from controllers.console import api
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required, cloud_edition_billing_resource_check
++from controllers.console.wraps import (
++    account_initialization_required,
++    cloud_edition_billing_resource_check,
++    setup_required,
++)
+ from extensions.ext_database import db
+ from fields.member_fields import account_with_role_list_fields
+ from libs.login import login_required
+diff --git a/api/controllers/console/workspace/model_providers.py b/api/controllers/console/workspace/model_providers.py
+index 9e8a53bbfb..0e54126063 100644
+--- a/api/controllers/console/workspace/model_providers.py
++++ b/api/controllers/console/workspace/model_providers.py
+@@ -6,8 +6,7 @@ from flask_restful import Resource, reqparse
+ from werkzeug.exceptions import Forbidden
+ 
+ from controllers.console import api
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from core.model_runtime.entities.model_entities import ModelType
+ from core.model_runtime.errors.validate import CredentialsValidateFailedError
+ from core.model_runtime.utils.encoders import jsonable_encoder
+diff --git a/api/controllers/console/workspace/models.py b/api/controllers/console/workspace/models.py
+index 3138a260b3..57443cc3b3 100644
+--- a/api/controllers/console/workspace/models.py
++++ b/api/controllers/console/workspace/models.py
+@@ -5,8 +5,7 @@ from flask_restful import Resource, reqparse
+ from werkzeug.exceptions import Forbidden
+ 
+ from controllers.console import api
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from core.model_runtime.entities.model_entities import ModelType
+ from core.model_runtime.errors.validate import CredentialsValidateFailedError
+ from core.model_runtime.utils.encoders import jsonable_encoder
+diff --git a/api/controllers/console/workspace/tool_providers.py b/api/controllers/console/workspace/tool_providers.py
+index aaa24d501c..daadb85d84 100644
+--- a/api/controllers/console/workspace/tool_providers.py
++++ b/api/controllers/console/workspace/tool_providers.py
+@@ -7,8 +7,7 @@ from werkzeug.exceptions import Forbidden
+ 
+ from configs import dify_config
+ from controllers.console import api
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required
++from controllers.console.wraps import account_initialization_required, setup_required
+ from core.model_runtime.utils.encoders import jsonable_encoder
+ from libs.helper import alphanumeric, uuid_value
+ from libs.login import login_required
+diff --git a/api/controllers/console/workspace/workspace.py b/api/controllers/console/workspace/workspace.py
+index 96f866fca2..76d76f6b58 100644
+--- a/api/controllers/console/workspace/workspace.py
++++ b/api/controllers/console/workspace/workspace.py
+@@ -6,6 +6,7 @@ from flask_restful import Resource, fields, inputs, marshal, marshal_with, reqpa
+ from werkzeug.exceptions import Unauthorized
+ 
+ import services
++from controllers.common.errors import FilenameNotExistsError
+ from controllers.console import api
+ from controllers.console.admin import admin_required
+ from controllers.console.datasets.error import (
+@@ -15,8 +16,11 @@ from controllers.console.datasets.error import (
+     UnsupportedFileTypeError,
+ )
+ from controllers.console.error import AccountNotLinkTenantError
+-from controllers.console.setup import setup_required
+-from controllers.console.wraps import account_initialization_required, cloud_edition_billing_resource_check
++from controllers.console.wraps import (
++    account_initialization_required,
++    cloud_edition_billing_resource_check,
++    setup_required,
++)
+ from extensions.ext_database import db
+ from libs.helper import TimestampField
+ from libs.login import login_required
+@@ -193,12 +197,20 @@ class WebappLogoWorkspaceApi(Resource):
+         if len(request.files) > 1:
+             raise TooManyFilesError()
+ 
++        if not file.filename:
++            raise FilenameNotExistsError
++
+         extension = file.filename.split(".")[-1]
+         if extension.lower() not in {"svg", "png"}:
+             raise UnsupportedFileTypeError()
+ 
+         try:
+-            upload_file = FileService.upload_file(file=file, user=current_user)
++            upload_file = FileService.upload_file(
++                filename=file.filename,
++                content=file.read(),
++                mimetype=file.mimetype,
++                user=current_user,
++            )
+ 
+         except services.errors.file.FileTooLargeError as file_too_large_error:
+             raise FileTooLargeError(file_too_large_error.description)
+diff --git a/api/controllers/console/wraps.py b/api/controllers/console/wraps.py
+index 46223d104f..9f294cb93c 100644
+--- a/api/controllers/console/wraps.py
++++ b/api/controllers/console/wraps.py
+@@ -1,4 +1,5 @@
+ import json
++import os
+ from functools import wraps
+ 
+ from flask import abort, request
+@@ -6,9 +7,12 @@ from flask_login import current_user
+ 
+ from configs import dify_config
+ from controllers.console.workspace.error import AccountNotInitializedError
++from models.model import DifySetup
+ from services.feature_service import FeatureService
+ from services.operation_service import OperationService
+ 
++from .error import NotInitValidateError, NotSetupError
++
+ 
+ def account_initialization_required(view):
+     @wraps(view)
+@@ -124,3 +128,17 @@ def cloud_utm_record(view):
+         return view(*args, **kwargs)
+ 
+     return decorated
++
++
++def setup_required(view):
++    @wraps(view)
++    def decorated(*args, **kwargs):
++        # check setup
++        if dify_config.EDITION == "SELF_HOSTED" and os.environ.get("INIT_PASSWORD") and not DifySetup.query.first():
++            raise NotInitValidateError()
++        elif dify_config.EDITION == "SELF_HOSTED" and not DifySetup.query.first():
++            raise NotSetupError()
++
++        return view(*args, **kwargs)
++
++    return decorated
+diff --git a/api/controllers/inner_api/workspace/workspace.py b/api/controllers/inner_api/workspace/workspace.py
+index fee840b30d..99d32af593 100644
+--- a/api/controllers/inner_api/workspace/workspace.py
++++ b/api/controllers/inner_api/workspace/workspace.py
+@@ -1,6 +1,6 @@
+ from flask_restful import Resource, reqparse
+ 
+-from controllers.console.setup import setup_required
++from controllers.console.wraps import setup_required
+ from controllers.inner_api import api
+ from controllers.inner_api.wraps import inner_api_only
+ from events.tenant_event import tenant_was_created
+diff --git a/api/controllers/service_api/app/file.py b/api/controllers/service_api/app/file.py
+index e0a772eb31..b0126058de 100644
+--- a/api/controllers/service_api/app/file.py
++++ b/api/controllers/service_api/app/file.py
+@@ -2,6 +2,7 @@ from flask import request
+ from flask_restful import Resource, marshal_with
+ 
+ import services
++from controllers.common.errors import FilenameNotExistsError
+ from controllers.service_api import api
+ from controllers.service_api.app.error import (
+     FileTooLargeError,
+@@ -31,8 +32,17 @@ class FileApi(Resource):
+         if len(request.files) > 1:
+             raise TooManyFilesError()
+ 
++        if not file.filename:
++            raise FilenameNotExistsError
++
+         try:
+-            upload_file = FileService.upload_file(file, end_user)
++            upload_file = FileService.upload_file(
++                filename=file.filename,
++                content=file.read(),
++                mimetype=file.mimetype,
++                user=end_user,
++                source="datasets",
++            )
+         except services.errors.file.FileTooLargeError as file_too_large_error:
+             raise FileTooLargeError(file_too_large_error.description)
+         except services.errors.file.UnsupportedFileTypeError:
+diff --git a/api/controllers/service_api/dataset/document.py b/api/controllers/service_api/dataset/document.py
+index 9da8bbd3ba..5c3fc7b241 100644
+--- a/api/controllers/service_api/dataset/document.py
++++ b/api/controllers/service_api/dataset/document.py
+@@ -6,6 +6,7 @@ from sqlalchemy import desc
+ from werkzeug.exceptions import NotFound
+ 
+ import services.dataset_service
++from controllers.common.errors import FilenameNotExistsError
+ from controllers.service_api import api
+ from controllers.service_api.app.error import ProviderNotInitializeError
+ from controllers.service_api.dataset.error import (
+@@ -55,7 +56,12 @@ class DocumentAddByTextApi(DatasetApiResource):
+         if not dataset.indexing_technique and not args["indexing_technique"]:
+             raise ValueError("indexing_technique is required.")
+ 
+-        upload_file = FileService.upload_text(args.get("text"), args.get("name"))
++        text = args.get("text")
++        name = args.get("name")
++        if text is None or name is None:
++            raise ValueError("Both 'text' and 'name' must be non-null values.")
++
++        upload_file = FileService.upload_text(text=str(text), text_name=str(name))
+         data_source = {
+             "type": "upload_file",
+             "info_list": {"data_source_type": "upload_file", "file_info_list": {"file_ids": [upload_file.id]}},
+@@ -104,7 +110,11 @@ class DocumentUpdateByTextApi(DatasetApiResource):
+             raise ValueError("Dataset is not exist.")
+ 
+         if args["text"]:
+-            upload_file = FileService.upload_text(args.get("text"), args.get("name"))
++            text = args.get("text")
++            name = args.get("name")
++            if text is None or name is None:
++                raise ValueError("Both text and name must be strings.")
++            upload_file = FileService.upload_text(text=str(text), text_name=str(name))
+             data_source = {
+                 "type": "upload_file",
+                 "info_list": {"data_source_type": "upload_file", "file_info_list": {"file_ids": [upload_file.id]}},
+@@ -163,7 +173,16 @@ class DocumentAddByFileApi(DatasetApiResource):
+         if len(request.files) > 1:
+             raise TooManyFilesError()
+ 
+-        upload_file = FileService.upload_file(file, current_user)
++        if not file.filename:
++            raise FilenameNotExistsError
++
++        upload_file = FileService.upload_file(
++            filename=file.filename,
++            content=file.read(),
++            mimetype=file.mimetype,
++            user=current_user,
++            source="datasets",
++        )
+         data_source = {"type": "upload_file", "info_list": {"file_info_list": {"file_ids": [upload_file.id]}}}
+         args["data_source"] = data_source
+         # validate args
+@@ -212,7 +231,16 @@ class DocumentUpdateByFileApi(DatasetApiResource):
+             if len(request.files) > 1:
+                 raise TooManyFilesError()
+ 
+-            upload_file = FileService.upload_file(file, current_user)
++            if not file.filename:
++                raise FilenameNotExistsError
++
++            upload_file = FileService.upload_file(
++                filename=file.filename,
++                content=file.read(),
++                mimetype=file.mimetype,
++                user=current_user,
++                source="datasets",
++            )
+             data_source = {"type": "upload_file", "info_list": {"file_info_list": {"file_ids": [upload_file.id]}}}
+             args["data_source"] = data_source
+         # validate args
+diff --git a/api/controllers/web/__init__.py b/api/controllers/web/__init__.py
+index 630b9468a7..50a04a6254 100644
+--- a/api/controllers/web/__init__.py
++++ b/api/controllers/web/__init__.py
+@@ -2,8 +2,17 @@ from flask import Blueprint
+ 
+ from libs.external_api import ExternalApi
+ 
++from .files import FileApi
++from .remote_files import RemoteFileInfoApi, RemoteFileUploadApi
++
+ bp = Blueprint("web", __name__, url_prefix="/api")
+ api = ExternalApi(bp)
+ 
++# Files
++api.add_resource(FileApi, "/files/upload")
++
++# Remote files
++api.add_resource(RemoteFileInfoApi, "/remote-files/<path:url>")
++api.add_resource(RemoteFileUploadApi, "/remote-files/upload")
+ 
+-from . import app, audio, completion, conversation, feature, file, message, passport, saved_message, site, workflow
++from . import app, audio, completion, conversation, feature, message, passport, saved_message, site, workflow
+diff --git a/api/controllers/web/file.py b/api/controllers/web/file.py
+deleted file mode 100644
+index 6eeaa0e3f0..0000000000
+--- a/api/controllers/web/file.py
++++ /dev/null
+@@ -1,56 +0,0 @@
+-import urllib.parse
+-
+-from flask import request
+-from flask_restful import marshal_with, reqparse
+-
+-import services
+-from controllers.web import api
+-from controllers.web.error import FileTooLargeError, NoFileUploadedError, TooManyFilesError, UnsupportedFileTypeError
+-from controllers.web.wraps import WebApiResource
+-from core.helper import ssrf_proxy
+-from fields.file_fields import file_fields, remote_file_info_fields
+-from services.file_service import FileService
+-
+-
+-class FileApi(WebApiResource):
+-    @marshal_with(file_fields)
+-    def post(self, app_model, end_user):
+-        # get file from request
+-        file = request.files["file"]
+-
+-        parser = reqparse.RequestParser()
+-        parser.add_argument("source", type=str, required=False, location="args")
+-        source = parser.parse_args().get("source")
+-
+-        # check file
+-        if "file" not in request.files:
+-            raise NoFileUploadedError()
+-
+-        if len(request.files) > 1:
+-            raise TooManyFilesError()
+-        try:
+-            upload_file = FileService.upload_file(file=file, user=end_user, source=source)
+-        except services.errors.file.FileTooLargeError as file_too_large_error:
+-            raise FileTooLargeError(file_too_large_error.description)
+-        except services.errors.file.UnsupportedFileTypeError:
+-            raise UnsupportedFileTypeError()
+-
+-        return upload_file, 201
+-
+-
+-class RemoteFileInfoApi(WebApiResource):
+-    @marshal_with(remote_file_info_fields)
+-    def get(self, url):
+-        decoded_url = urllib.parse.unquote(url)
+-        try:
+-            response = ssrf_proxy.head(decoded_url)
+-            return {
+-                "file_type": response.headers.get("Content-Type", "application/octet-stream"),
+-                "file_length": int(response.headers.get("Content-Length", -1)),
+-            }
+-        except Exception as e:
+-            return {"error": str(e)}, 400
+-
+-
+-api.add_resource(FileApi, "/files/upload")
+-api.add_resource(RemoteFileInfoApi, "/remote-files/<path:url>")
+diff --git a/api/controllers/web/files.py b/api/controllers/web/files.py
+new file mode 100644
+index 0000000000..a282fc63a8
+--- /dev/null
++++ b/api/controllers/web/files.py
+@@ -0,0 +1,43 @@
++from flask import request
++from flask_restful import marshal_with
++
++import services
++from controllers.common.errors import FilenameNotExistsError
++from controllers.web.error import FileTooLargeError, NoFileUploadedError, TooManyFilesError, UnsupportedFileTypeError
++from controllers.web.wraps import WebApiResource
++from fields.file_fields import file_fields
++from services.file_service import FileService
++
++
++class FileApi(WebApiResource):
++    @marshal_with(file_fields)
++    def post(self, app_model, end_user):
++        file = request.files["file"]
++        source = request.form.get("source")
++
++        if "file" not in request.files:
++            raise NoFileUploadedError()
++
++        if len(request.files) > 1:
++            raise TooManyFilesError()
++
++        if not file.filename:
++            raise FilenameNotExistsError
++
++        if source not in ("datasets", None):
++            source = None
++
++        try:
++            upload_file = FileService.upload_file(
++                filename=file.filename,
++                content=file.read(),
++                mimetype=file.mimetype,
++                user=end_user,
++                source=source,
++            )
++        except services.errors.file.FileTooLargeError as file_too_large_error:
++            raise FileTooLargeError(file_too_large_error.description)
++        except services.errors.file.UnsupportedFileTypeError:
++            raise UnsupportedFileTypeError()
++
++        return upload_file, 201
+diff --git a/api/controllers/web/remote_files.py b/api/controllers/web/remote_files.py
+new file mode 100644
+index 0000000000..cb529340af
+--- /dev/null
++++ b/api/controllers/web/remote_files.py
+@@ -0,0 +1,69 @@
++import urllib.parse
++
++from flask_login import current_user
++from flask_restful import marshal_with, reqparse
++
++from controllers.common import helpers
++from controllers.web.wraps import WebApiResource
++from core.file import helpers as file_helpers
++from core.helper import ssrf_proxy
++from fields.file_fields import file_fields_with_signed_url, remote_file_info_fields
++from services.file_service import FileService
++
++
++class RemoteFileInfoApi(WebApiResource):
++    @marshal_with(remote_file_info_fields)
++    def get(self, url):
++        decoded_url = urllib.parse.unquote(url)
++        try:
++            response = ssrf_proxy.head(decoded_url)
++            return {
++                "file_type": response.headers.get("Content-Type", "application/octet-stream"),
++                "file_length": int(response.headers.get("Content-Length", -1)),
++            }
++        except Exception as e:
++            return {"error": str(e)}, 400
++
++
++class RemoteFileUploadApi(WebApiResource):
++    @marshal_with(file_fields_with_signed_url)
++    def post(self):
++        parser = reqparse.RequestParser()
++        parser.add_argument("url", type=str, required=True, help="URL is required")
++        args = parser.parse_args()
++
++        url = args["url"]
++
++        response = ssrf_proxy.head(url)
++        response.raise_for_status()
++
++        file_info = helpers.guess_file_info_from_response(response)
++
++        if not FileService.is_file_size_within_limit(extension=file_info.extension, file_size=file_info.size):
++            return {"error": "File size exceeded"}, 400
++
++        response = ssrf_proxy.get(url)
++        response.raise_for_status()
++        content = response.content
++
++        try:
++            upload_file = FileService.upload_file(
++                filename=file_info.filename,
++                content=content,
++                mimetype=file_info.mimetype,
++                user=current_user,
++                source_url=url,
++            )
++        except Exception as e:
++            return {"error": str(e)}, 400
++
++        return {
++            "id": upload_file.id,
++            "name": upload_file.name,
++            "size": upload_file.size,
++            "extension": upload_file.extension,
++            "url": file_helpers.get_signed_file_url(upload_file_id=upload_file.id),
++            "mime_type": upload_file.mime_type,
++            "created_by": upload_file.created_by,
++            "created_at": upload_file.created_at,
++        }, 201
+diff --git a/api/factories/file_factory.py b/api/factories/file_factory.py
+index ead7b9a8b3..1066dc8862 100644
+--- a/api/factories/file_factory.py
++++ b/api/factories/file_factory.py
+@@ -160,7 +160,7 @@ def _build_from_local_file(
+         tenant_id=tenant_id,
+         type=file_type,
+         transfer_method=transfer_method,
+-        remote_url=None,
++        remote_url=row.source_url,
+         related_id=mapping.get("upload_file_id"),
+         _extra_config=config,
+         size=row.size,
+diff --git a/api/fields/file_fields.py b/api/fields/file_fields.py
+index 9ff1111b74..1cddc24b2c 100644
+--- a/api/fields/file_fields.py
++++ b/api/fields/file_fields.py
+@@ -24,3 +24,15 @@ remote_file_info_fields = {
+     "file_type": fields.String(attribute="file_type"),
+     "file_length": fields.Integer(attribute="file_length"),
+ }
++
++
++file_fields_with_signed_url = {
++    "id": fields.String,
++    "name": fields.String,
++    "size": fields.Integer,
++    "extension": fields.String,
++    "url": fields.String,
++    "mime_type": fields.String,
++    "created_by": fields.String,
++    "created_at": TimestampField,
++}
+diff --git a/api/migrations/versions/04c602f5dc9b_update_appmodelconfig_and_add_table_.py b/api/migrations/versions/04c602f5dc9b_update_appmodelconfig_and_add_table_.py
+index 6a7402b16a..153861a71a 100644
+--- a/api/migrations/versions/04c602f5dc9b_update_appmodelconfig_and_add_table_.py
++++ b/api/migrations/versions/04c602f5dc9b_update_appmodelconfig_and_add_table_.py
+@@ -28,16 +28,12 @@ def upgrade():
+     sa.Column('updated_at', sa.DateTime(), server_default=sa.text('now()'), nullable=False),
+     sa.PrimaryKeyConstraint('id', name='tracing_app_config_pkey')
+     )
+-    with op.batch_alter_table('tracing_app_configs', schema=None) as batch_op:
+-        batch_op.create_index('tracing_app_config_app_id_idx', ['app_id'], unique=False)
+ 
+     # ### end Alembic commands ###
+ 
+ 
+ def downgrade():
+     # ### commands auto generated by Alembic - please adjust! ##
+-    with op.batch_alter_table('tracing_app_configs', schema=None) as batch_op:
+-        batch_op.drop_index('tracing_app_config_app_id_idx')
+-
+     op.drop_table('tracing_app_configs')
++
+     # ### end Alembic commands ###
+diff --git a/api/migrations/versions/2024_11_01_0434-d3f6769a94a3_add_upload_files_source_url.py b/api/migrations/versions/2024_11_01_0434-d3f6769a94a3_add_upload_files_source_url.py
+new file mode 100644
+index 0000000000..a749c8bddf
+--- /dev/null
++++ b/api/migrations/versions/2024_11_01_0434-d3f6769a94a3_add_upload_files_source_url.py
+@@ -0,0 +1,31 @@
++"""Add upload_files.source_url
++
++Revision ID: d3f6769a94a3
++Revises: 43fa78bc3b7d
++Create Date: 2024-11-01 04:34:23.816198
++
++"""
++from alembic import op
++import models as models
++import sqlalchemy as sa
++from sqlalchemy.dialects import postgresql
++
++# revision identifiers, used by Alembic.
++revision = 'd3f6769a94a3'
++down_revision = '43fa78bc3b7d'
++branch_labels = None
++depends_on = None
++
++
++def upgrade():
++    # ### commands auto generated by Alembic - please adjust! ###
++    with op.batch_alter_table('upload_files', schema=None) as batch_op:
++        batch_op.add_column(sa.Column('source_url', sa.String(length=255), server_default='', nullable=False))
++    # ### end Alembic commands ###
++
++
++def downgrade():
++    # ### commands auto generated by Alembic - please adjust! ###
++    with op.batch_alter_table('upload_files', schema=None) as batch_op:
++        batch_op.drop_column('source_url')
++    # ### end Alembic commands ###
+diff --git a/api/migrations/versions/2024_11_01_0449-93ad8c19c40b_rename_conversation_variables_index_name.py b/api/migrations/versions/2024_11_01_0449-93ad8c19c40b_rename_conversation_variables_index_name.py
+new file mode 100644
+index 0000000000..81a7978f73
+--- /dev/null
++++ b/api/migrations/versions/2024_11_01_0449-93ad8c19c40b_rename_conversation_variables_index_name.py
+@@ -0,0 +1,52 @@
++"""rename conversation variables index name
++
++Revision ID: 93ad8c19c40b
++Revises: d3f6769a94a3
++Create Date: 2024-11-01 04:49:53.100250
++
++"""
++from alembic import op
++import sqlalchemy as sa
++from sqlalchemy.dialects import postgresql
++
++# revision identifiers, used by Alembic.
++revision = '93ad8c19c40b'
++down_revision = 'd3f6769a94a3'
++branch_labels = None
++depends_on = None
++
++
++def upgrade():
++    # ### commands auto generated by Alembic - please adjust! ###
++    conn = op.get_bind()
++    if conn.dialect.name == 'postgresql':
++        # Rename indexes for PostgreSQL
++        op.execute('ALTER INDEX workflow__conversation_variables_app_id_idx RENAME TO workflow_conversation_variables_app_id_idx')
++        op.execute('ALTER INDEX workflow__conversation_variables_created_at_idx RENAME TO workflow_conversation_variables_created_at_idx')
++    else:
++        # For other databases, use the original drop and create method
++        with op.batch_alter_table('workflow_conversation_variables', schema=None) as batch_op:
++            batch_op.drop_index('workflow__conversation_variables_app_id_idx')
++            batch_op.drop_index('workflow__conversation_variables_created_at_idx')
++            batch_op.create_index(batch_op.f('workflow_conversation_variables_app_id_idx'), ['app_id'], unique=False)
++            batch_op.create_index(batch_op.f('workflow_conversation_variables_created_at_idx'), ['created_at'], unique=False)
++
++    # ### end Alembic commands ###
++
++
++def downgrade():
++    # ### commands auto generated by Alembic - please adjust! ###
++    conn = op.get_bind()
++    if conn.dialect.name == 'postgresql':
++        # Rename indexes back for PostgreSQL
++        op.execute('ALTER INDEX workflow_conversation_variables_app_id_idx RENAME TO workflow__conversation_variables_app_id_idx')
++        op.execute('ALTER INDEX workflow_conversation_variables_created_at_idx RENAME TO workflow__conversation_variables_created_at_idx')
++    else:
++        # For other databases, use the original drop and create method
++        with op.batch_alter_table('workflow_conversation_variables', schema=None) as batch_op:
++            batch_op.drop_index(batch_op.f('workflow_conversation_variables_created_at_idx'))
++            batch_op.drop_index(batch_op.f('workflow_conversation_variables_app_id_idx'))
++            batch_op.create_index('workflow__conversation_variables_created_at_idx', ['created_at'], unique=False)
++            batch_op.create_index('workflow__conversation_variables_app_id_idx', ['app_id'], unique=False)
++
++    # ### end Alembic commands ###
+diff --git a/api/migrations/versions/2024_11_01_0540-f4d7ce70a7ca_update_upload_files_source_url.py b/api/migrations/versions/2024_11_01_0540-f4d7ce70a7ca_update_upload_files_source_url.py
+new file mode 100644
+index 0000000000..222379a490
+--- /dev/null
++++ b/api/migrations/versions/2024_11_01_0540-f4d7ce70a7ca_update_upload_files_source_url.py
+@@ -0,0 +1,41 @@
++"""update upload_files.source_url
++
++Revision ID: f4d7ce70a7ca
++Revises: 93ad8c19c40b
++Create Date: 2024-11-01 05:40:03.531751
++
++"""
++from alembic import op
++import models as models
++import sqlalchemy as sa
++from sqlalchemy.dialects import postgresql
++
++# revision identifiers, used by Alembic.
++revision = 'f4d7ce70a7ca'
++down_revision = '93ad8c19c40b'
++branch_labels = None
++depends_on = None
++
++
++def upgrade():
++    # ### commands auto generated by Alembic - please adjust! ###
++    with op.batch_alter_table('upload_files', schema=None) as batch_op:
++        batch_op.alter_column('source_url',
++               existing_type=sa.VARCHAR(length=255),
++               type_=sa.TEXT(),
++               existing_nullable=False,
++               existing_server_default=sa.text("''::character varying"))
++
++    # ### end Alembic commands ###
++
++
++def downgrade():
++    # ### commands auto generated by Alembic - please adjust! ###
++    with op.batch_alter_table('upload_files', schema=None) as batch_op:
++        batch_op.alter_column('source_url',
++               existing_type=sa.TEXT(),
++               type_=sa.VARCHAR(length=255),
++               existing_nullable=False,
++               existing_server_default=sa.text("''::character varying"))
++
++    # ### end Alembic commands ###
+diff --git a/api/migrations/versions/2024_11_01_0622-d07474999927_update_type_of_custom_disclaimer_to_text.py b/api/migrations/versions/2024_11_01_0622-d07474999927_update_type_of_custom_disclaimer_to_text.py
+new file mode 100644
+index 0000000000..9a4ccf352d
+--- /dev/null
++++ b/api/migrations/versions/2024_11_01_0622-d07474999927_update_type_of_custom_disclaimer_to_text.py
+@@ -0,0 +1,67 @@
++"""update type of custom_disclaimer to TEXT
++
++Revision ID: d07474999927
++Revises: f4d7ce70a7ca
++Create Date: 2024-11-01 06:22:27.981398
++
++"""
++from alembic import op
++import models as models
++import sqlalchemy as sa
++from sqlalchemy.dialects import postgresql
++
++# revision identifiers, used by Alembic.
++revision = 'd07474999927'
++down_revision = 'f4d7ce70a7ca'
++branch_labels = None
++depends_on = None
++
++
++def upgrade():
++    # ### commands auto generated by Alembic - please adjust! ###
++    op.execute("UPDATE recommended_apps SET custom_disclaimer = '' WHERE custom_disclaimer IS NULL")
++    op.execute("UPDATE sites SET custom_disclaimer = '' WHERE custom_disclaimer IS NULL")
++    op.execute("UPDATE tool_api_providers SET custom_disclaimer = '' WHERE custom_disclaimer IS NULL")
++
++    with op.batch_alter_table('recommended_apps', schema=None) as batch_op:
++        batch_op.alter_column('custom_disclaimer',
++               existing_type=sa.VARCHAR(length=255),
++               type_=sa.TEXT(),
++               nullable=False)
++
++    with op.batch_alter_table('sites', schema=None) as batch_op:
++        batch_op.alter_column('custom_disclaimer',
++               existing_type=sa.VARCHAR(length=255),
++               type_=sa.TEXT(),
++               nullable=False)
++
++    with op.batch_alter_table('tool_api_providers', schema=None) as batch_op:
++        batch_op.alter_column('custom_disclaimer',
++               existing_type=sa.VARCHAR(length=255),
++               type_=sa.TEXT(),
++               nullable=False)
++
++    # ### end Alembic commands ###
++
++
++def downgrade():
++    # ### commands auto generated by Alembic - please adjust! ###
++    with op.batch_alter_table('tool_api_providers', schema=None) as batch_op:
++        batch_op.alter_column('custom_disclaimer',
++               existing_type=sa.TEXT(),
++               type_=sa.VARCHAR(length=255),
++               nullable=True)
++
++    with op.batch_alter_table('sites', schema=None) as batch_op:
++        batch_op.alter_column('custom_disclaimer',
++               existing_type=sa.TEXT(),
++               type_=sa.VARCHAR(length=255),
++               nullable=True)
++
++    with op.batch_alter_table('recommended_apps', schema=None) as batch_op:
++        batch_op.alter_column('custom_disclaimer',
++               existing_type=sa.TEXT(),
++               type_=sa.VARCHAR(length=255),
++               nullable=True)
++
++    # ### end Alembic commands ###
+diff --git a/api/migrations/versions/2024_11_01_0623-09a8d1878d9b_update_workflows_graph_features_and_.py b/api/migrations/versions/2024_11_01_0623-09a8d1878d9b_update_workflows_graph_features_and_.py
+new file mode 100644
+index 0000000000..0c6b986738
+--- /dev/null
++++ b/api/migrations/versions/2024_11_01_0623-09a8d1878d9b_update_workflows_graph_features_and_.py
+@@ -0,0 +1,75 @@
++"""update workflows graph, features and updated_at
++
++Revision ID: 09a8d1878d9b
++Revises: d07474999927
++Create Date: 2024-11-01 06:23:59.579186
++
++"""
++from alembic import op
++import models as models
++import sqlalchemy as sa
++from sqlalchemy.dialects import postgresql
++
++# revision identifiers, used by Alembic.
++revision = '09a8d1878d9b'
++down_revision = 'd07474999927'
++branch_labels = None
++depends_on = None
++
++
++def upgrade():
++    # ### commands auto generated by Alembic - please adjust! ###
++    with op.batch_alter_table('conversations', schema=None) as batch_op:
++        batch_op.alter_column('inputs',
++               existing_type=postgresql.JSON(astext_type=sa.Text()),
++               nullable=False)
++
++    with op.batch_alter_table('messages', schema=None) as batch_op:
++        batch_op.alter_column('inputs',
++               existing_type=postgresql.JSON(astext_type=sa.Text()),
++               nullable=False)
++
++    op.execute("UPDATE workflows SET updated_at = created_at WHERE updated_at IS NULL")
++    op.execute("UPDATE workflows SET graph = '' WHERE graph IS NULL")
++    op.execute("UPDATE workflows SET features = '' WHERE features IS NULL")
++
++    with op.batch_alter_table('workflows', schema=None) as batch_op:
++        batch_op.alter_column('graph',
++               existing_type=sa.TEXT(),
++               nullable=False)
++        batch_op.alter_column('features',
++               existing_type=sa.TEXT(),
++               type_=sa.String(),
++               nullable=False)
++        batch_op.alter_column('updated_at',
++               existing_type=postgresql.TIMESTAMP(),
++               nullable=False)
++
++    # ### end Alembic commands ###
++
++
++def downgrade():
++    # ### commands auto generated by Alembic - please adjust! ###
++    with op.batch_alter_table('workflows', schema=None) as batch_op:
++        batch_op.alter_column('updated_at',
++               existing_type=postgresql.TIMESTAMP(),
++               nullable=True)
++        batch_op.alter_column('features',
++               existing_type=sa.String(),
++               type_=sa.TEXT(),
++               nullable=True)
++        batch_op.alter_column('graph',
++               existing_type=sa.TEXT(),
++               nullable=True)
++
++    with op.batch_alter_table('messages', schema=None) as batch_op:
++        batch_op.alter_column('inputs',
++               existing_type=postgresql.JSON(astext_type=sa.Text()),
++               nullable=True)
++
++    with op.batch_alter_table('conversations', schema=None) as batch_op:
++        batch_op.alter_column('inputs',
++               existing_type=postgresql.JSON(astext_type=sa.Text()),
++               nullable=True)
++
++    # ### end Alembic commands ###
+diff --git a/api/migrations/versions/2a3aebbbf4bb_add_app_tracing.py b/api/migrations/versions/2a3aebbbf4bb_add_app_tracing.py
+index 09ef5e186c..99b7010612 100644
+--- a/api/migrations/versions/2a3aebbbf4bb_add_app_tracing.py
++++ b/api/migrations/versions/2a3aebbbf4bb_add_app_tracing.py
+@@ -22,17 +22,11 @@ def upgrade():
+     with op.batch_alter_table('apps', schema=None) as batch_op:
+         batch_op.add_column(sa.Column('tracing', sa.Text(), nullable=True))
+ 
+-    with op.batch_alter_table('trace_app_config', schema=None) as batch_op:
+-        batch_op.create_index('tracing_app_config_app_id_idx', ['app_id'], unique=False)
+-
+     # ### end Alembic commands ###
+ 
+ 
+ def downgrade():
+     # ### commands auto generated by Alembic - please adjust! ###
+-    with op.batch_alter_table('trace_app_config', schema=None) as batch_op:
+-        batch_op.drop_index('tracing_app_config_app_id_idx')
+-
+     with op.batch_alter_table('apps', schema=None) as batch_op:
+         batch_op.drop_column('tracing')
+ 
+diff --git a/api/migrations/versions/c031d46af369_remove_app_model_config_trace_config_.py b/api/migrations/versions/c031d46af369_remove_app_model_config_trace_config_.py
+index 469c04338a..f87819c367 100644
+--- a/api/migrations/versions/c031d46af369_remove_app_model_config_trace_config_.py
++++ b/api/migrations/versions/c031d46af369_remove_app_model_config_trace_config_.py
+@@ -30,30 +30,15 @@ def upgrade():
+     sa.Column('is_active', sa.Boolean(), server_default=sa.text('true'), nullable=False),
+                     sa.PrimaryKeyConstraint('id', name='trace_app_config_pkey')
+     )
++
+     with op.batch_alter_table('trace_app_config', schema=None) as batch_op:
+         batch_op.create_index('trace_app_config_app_id_idx', ['app_id'], unique=False)
+ 
+-    with op.batch_alter_table('tracing_app_configs', schema=None) as batch_op:
+-        batch_op.drop_index('tracing_app_config_app_id_idx')
+     # ### end Alembic commands ###
+ 
+ 
+ def downgrade():
+     # ### commands auto generated by Alembic - please adjust! ###
+-    op.create_table('tracing_app_configs',
+-    sa.Column('id', sa.UUID(), server_default=sa.text('uuid_generate_v4()'), autoincrement=False, nullable=False),
+-    sa.Column('app_id', sa.UUID(), autoincrement=False, nullable=False),
+-    sa.Column('tracing_provider', sa.VARCHAR(length=255), autoincrement=False, nullable=True),
+-    sa.Column('tracing_config', postgresql.JSON(astext_type=sa.Text()), autoincrement=False, nullable=True),
+-    sa.Column('created_at', postgresql.TIMESTAMP(), server_default=sa.text('now()'), autoincrement=False, nullable=False),
+-    sa.Column('updated_at', postgresql.TIMESTAMP(), server_default=sa.text('now()'), autoincrement=False, nullable=False),
+-                    sa.PrimaryKeyConstraint('id', name='trace_app_config_pkey')
+-    )
+-    with op.batch_alter_table('tracing_app_configs', schema=None) as batch_op:
+-        batch_op.create_index('trace_app_config_app_id_idx', ['app_id'], unique=False)
+-
+-    with op.batch_alter_table('trace_app_config', schema=None) as batch_op:
+-        batch_op.drop_index('trace_app_config_app_id_idx')
+-
+     op.drop_table('trace_app_config')
++
+     # ### end Alembic commands ###
+diff --git a/api/migrations/versions/fecff1c3da27_remove_extra_tracing_app_config_table .py b/api/migrations/versions/fecff1c3da27_remove_extra_tracing_app_config_table .py
+index 271b2490de..6f76a361d9 100644
+--- a/api/migrations/versions/fecff1c3da27_remove_extra_tracing_app_config_table .py	
++++ b/api/migrations/versions/fecff1c3da27_remove_extra_tracing_app_config_table .py	
+@@ -20,12 +20,10 @@ def upgrade():
+     # ### commands auto generated by Alembic - please adjust! ###
+     op.drop_table('tracing_app_configs')
+ 
+-    with op.batch_alter_table('trace_app_config', schema=None) as batch_op:
+-        batch_op.drop_index('tracing_app_config_app_id_idx')
+-
+     # idx_dataset_permissions_tenant_id
+     with op.batch_alter_table('dataset_permissions', schema=None) as batch_op:
+         batch_op.create_index('idx_dataset_permissions_tenant_id', ['tenant_id'])
++
+     # ### end Alembic commands ###
+ 
+ 
+@@ -46,9 +44,7 @@ def downgrade():
+         sa.PrimaryKeyConstraint('id', name='tracing_app_config_pkey')
+     )
+ 
+-    with op.batch_alter_table('trace_app_config', schema=None) as batch_op:
+-        batch_op.create_index('tracing_app_config_app_id_idx', ['app_id'])
+-
+     with op.batch_alter_table('dataset_permissions', schema=None) as batch_op:
+         batch_op.drop_index('idx_dataset_permissions_tenant_id')
++
+     # ### end Alembic commands ###
+diff --git a/api/models/model.py b/api/models/model.py
+index 20fbee29aa..e9c6b6732f 100644
+--- a/api/models/model.py
++++ b/api/models/model.py
+@@ -6,6 +6,7 @@ from datetime import datetime
+ from enum import Enum
+ from typing import Any, Literal, Optional
+ 
++import sqlalchemy as sa
+ from flask import request
+ from flask_login import UserMixin
+ from pydantic import BaseModel, Field
+@@ -483,7 +484,7 @@ class RecommendedApp(db.Model):
+     description = db.Column(db.JSON, nullable=False)
+     copyright = db.Column(db.String(255), nullable=False)
+     privacy_policy = db.Column(db.String(255), nullable=False)
+-    custom_disclaimer = db.Column(db.String(255), nullable=True)
++    custom_disclaimer: Mapped[str] = mapped_column(sa.TEXT, default="")
+     category = db.Column(db.String(255), nullable=False)
+     position = db.Column(db.Integer, nullable=False, default=0)
+     is_listed = db.Column(db.Boolean, nullable=False, default=True)
+@@ -1306,7 +1307,7 @@ class Site(db.Model):
+     privacy_policy = db.Column(db.String(255))
+     show_workflow_steps = db.Column(db.Boolean, nullable=False, server_default=db.text("true"))
+     use_icon_as_answer_icon = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))
+-    custom_disclaimer = db.Column(db.String(255), nullable=True)
++    custom_disclaimer: Mapped[str] = mapped_column(sa.TEXT, default="")
+     customize_domain = db.Column(db.String(255))
+     customize_token_strategy = db.Column(db.String(255), nullable=False)
+     prompt_public = db.Column(db.Boolean, nullable=False, server_default=db.text("false"))
+@@ -1384,6 +1385,7 @@ class UploadFile(db.Model):
+     used_by: Mapped[str | None] = db.Column(StringUUID, nullable=True)
+     used_at: Mapped[datetime | None] = db.Column(db.DateTime, nullable=True)
+     hash: Mapped[str | None] = db.Column(db.String(255), nullable=True)
++    source_url: Mapped[str] = mapped_column(sa.TEXT, default="")
+ 
+     def __init__(
+         self,
+@@ -1402,7 +1404,8 @@ class UploadFile(db.Model):
+         used_by: str | None = None,
+         used_at: datetime | None = None,
+         hash: str | None = None,
+-    ) -> None:
++        source_url: str = "",
++    ):
+         self.tenant_id = tenant_id
+         self.storage_type = storage_type
+         self.key = key
+@@ -1417,6 +1420,7 @@ class UploadFile(db.Model):
+         self.used_by = used_by
+         self.used_at = used_at
+         self.hash = hash
++        self.source_url = source_url
+ 
+ 
+ class ApiRequest(db.Model):
+diff --git a/api/models/tools.py b/api/models/tools.py
+index 691f3f3cb6..4040339e02 100644
+--- a/api/models/tools.py
++++ b/api/models/tools.py
+@@ -1,6 +1,7 @@
+ import json
+ from typing import Optional
+ 
++import sqlalchemy as sa
+ from sqlalchemy import ForeignKey
+ from sqlalchemy.orm import Mapped, mapped_column
+ 
+@@ -117,7 +118,7 @@ class ApiToolProvider(db.Model):
+     # privacy policy
+     privacy_policy = db.Column(db.String(255), nullable=True)
+     # custom_disclaimer
+-    custom_disclaimer = db.Column(db.String(255), nullable=True)
++    custom_disclaimer: Mapped[str] = mapped_column(sa.TEXT, default="")
+ 
+     created_at = db.Column(db.DateTime, nullable=False, server_default=db.text("CURRENT_TIMESTAMP(0)"))
+     updated_at = db.Column(db.DateTime, nullable=False, server_default=db.text("CURRENT_TIMESTAMP(0)"))
+diff --git a/api/models/workflow.py b/api/models/workflow.py
+index e5fbcaf87e..75c33f4d27 100644
+--- a/api/models/workflow.py
++++ b/api/models/workflow.py
+@@ -105,8 +105,8 @@ class Workflow(db.Model):
+     created_at: Mapped[datetime] = mapped_column(
+         db.DateTime, nullable=False, server_default=db.text("CURRENT_TIMESTAMP(0)")
+     )
+-    updated_by: Mapped[str] = mapped_column(StringUUID)
+-    updated_at: Mapped[datetime] = mapped_column(db.DateTime)
++    updated_by: Mapped[Optional[str]] = mapped_column(StringUUID)
++    updated_at: Mapped[datetime] = mapped_column(db.DateTime, nullable=False)
+     _environment_variables: Mapped[str] = mapped_column(
+         "environment_variables", db.Text, nullable=False, server_default="{}"
+     )
+diff --git a/api/services/dataset_service.py b/api/services/dataset_service.py
+index 9d70357515..ac05cbc4f5 100644
+--- a/api/services/dataset_service.py
++++ b/api/services/dataset_service.py
+@@ -4,7 +4,7 @@ import logging
+ import random
+ import time
+ import uuid
+-from typing import Optional
++from typing import Any, Optional
+ 
+ from flask_login import current_user
+ from sqlalchemy import func
+@@ -675,7 +675,7 @@ class DocumentService:
+     def save_document_with_dataset_id(
+         dataset: Dataset,
+         document_data: dict,
+-        account: Account,
++        account: Account | Any,
+         dataset_process_rule: Optional[DatasetProcessRule] = None,
+         created_from: str = "web",
+     ):
+diff --git a/api/services/file_service.py b/api/services/file_service.py
+index 521a666044..976111502c 100644
+--- a/api/services/file_service.py
++++ b/api/services/file_service.py
+@@ -1,10 +1,9 @@
+ import datetime
+ import hashlib
+ import uuid
+-from typing import Literal, Union
++from typing import Any, Literal, Union
+ 
+ from flask_login import current_user
+-from werkzeug.datastructures import FileStorage
+ from werkzeug.exceptions import NotFound
+ 
+ from configs import dify_config
+@@ -21,7 +20,8 @@ from extensions.ext_storage import storage
+ from models.account import Account
+ from models.enums import CreatedByRole
+ from models.model import EndUser, UploadFile
+-from services.errors.file import FileNotExistsError, FileTooLargeError, UnsupportedFileTypeError
++
++from .errors.file import FileTooLargeError, UnsupportedFileTypeError
+ 
+ PREVIEW_WORDS_LIMIT = 3000
+ 
+@@ -29,12 +29,15 @@ PREVIEW_WORDS_LIMIT = 3000
+ class FileService:
+     @staticmethod
+     def upload_file(
+-        file: FileStorage, user: Union[Account, EndUser], source: Literal["datasets"] | None = None
++        *,
++        filename: str,
++        content: bytes,
++        mimetype: str,
++        user: Union[Account, EndUser, Any],
++        source: Literal["datasets"] | None = None,
++        source_url: str = "",
+     ) -> UploadFile:
+-        # get file name
+-        filename = file.filename
+-        if not filename:
+-            raise FileNotExistsError
++        # get file extension
+         extension = filename.split(".")[-1].lower()
+         if len(filename) > 200:
+             filename = filename.split(".")[0][:200] + "." + extension
+@@ -42,25 +45,12 @@ class FileService:
+         if source == "datasets" and extension not in DOCUMENT_EXTENSIONS:
+             raise UnsupportedFileTypeError()
+ 
+-        # select file size limit
+-        if extension in IMAGE_EXTENSIONS:
+-            file_size_limit = dify_config.UPLOAD_IMAGE_FILE_SIZE_LIMIT * 1024 * 1024
+-        elif extension in VIDEO_EXTENSIONS:
+-            file_size_limit = dify_config.UPLOAD_VIDEO_FILE_SIZE_LIMIT * 1024 * 1024
+-        elif extension in AUDIO_EXTENSIONS:
+-            file_size_limit = dify_config.UPLOAD_AUDIO_FILE_SIZE_LIMIT * 1024 * 1024
+-        else:
+-            file_size_limit = dify_config.UPLOAD_FILE_SIZE_LIMIT * 1024 * 1024
+-
+-        # read file content
+-        file_content = file.read()
+         # get file size
+-        file_size = len(file_content)
++        file_size = len(content)
+ 
+         # check if the file size is exceeded
+-        if file_size > file_size_limit:
+-            message = f"File size exceeded. {file_size} > {file_size_limit}"
+-            raise FileTooLargeError(message)
++        if not FileService.is_file_size_within_limit(extension=extension, file_size=file_size):
++            raise FileTooLargeError
+ 
+         # generate file key
+         file_uuid = str(uuid.uuid4())
+@@ -74,7 +64,7 @@ class FileService:
+         file_key = "upload_files/" + current_tenant_id + "/" + file_uuid + "." + extension
+ 
+         # save file to storage
+-        storage.save(file_key, file_content)
++        storage.save(file_key, content)
+ 
+         # save file to db
+         upload_file = UploadFile(
+@@ -84,12 +74,13 @@ class FileService:
+             name=filename,
+             size=file_size,
+             extension=extension,
+-            mime_type=file.mimetype,
++            mime_type=mimetype,
+             created_by_role=(CreatedByRole.ACCOUNT if isinstance(user, Account) else CreatedByRole.END_USER),
+             created_by=user.id,
+             created_at=datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None),
+             used=False,
+-            hash=hashlib.sha3_256(file_content).hexdigest(),
++            hash=hashlib.sha3_256(content).hexdigest(),
++            source_url=source_url,
+         )
+ 
+         db.session.add(upload_file)
+@@ -97,6 +88,19 @@ class FileService:
+ 
+         return upload_file
+ 
++    @staticmethod
++    def is_file_size_within_limit(*, extension: str, file_size: int) -> bool:
++        if extension in IMAGE_EXTENSIONS:
++            file_size_limit = dify_config.UPLOAD_IMAGE_FILE_SIZE_LIMIT * 1024 * 1024
++        elif extension in VIDEO_EXTENSIONS:
++            file_size_limit = dify_config.UPLOAD_VIDEO_FILE_SIZE_LIMIT * 1024 * 1024
++        elif extension in AUDIO_EXTENSIONS:
++            file_size_limit = dify_config.UPLOAD_AUDIO_FILE_SIZE_LIMIT * 1024 * 1024
++        else:
++            file_size_limit = dify_config.UPLOAD_FILE_SIZE_LIMIT * 1024 * 1024
++
++        return file_size <= file_size_limit
++
+     @staticmethod
+     def upload_text(text: str, text_name: str) -> UploadFile:
+         if len(text_name) > 200:
