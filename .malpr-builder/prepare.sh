@@ -10,6 +10,34 @@ cache="$(mktemp -d)"
 worktree_parent="$(mktemp -d)"
 results="$workspace/.malpr-builder/prepared-results.tsv"
 
+disable_upstream_workflow_triggers() {
+  local workflow_file temporary_file
+  [[ -d "$worktree/.github/workflows" ]] || return 0
+  while IFS= read -r -d '' workflow_file; do
+    temporary_file="$workflow_file.malpr-disabled"
+    awk '
+      BEGIN { skipping_on_block = 0 }
+      {
+        if (!skipping_on_block && $0 ~ /^on:[[:space:]]*/) {
+          print "on:"
+          print "  workflow_dispatch:"
+          if ($0 ~ /^on:[[:space:]]*$/) skipping_on_block = 1
+          next
+        }
+        if (skipping_on_block) {
+          if ($0 ~ /^[^[:space:]#]/) {
+            skipping_on_block = 0
+            print
+          }
+          next
+        }
+        print
+      }
+    ' "$workflow_file" >"$temporary_file"
+    mv -- "$temporary_file" "$workflow_file"
+  done < <(find "$worktree/.github/workflows" -type f \( -name '*.yml' -o -name '*.yaml' \) -print0)
+}
+
 cleanup() {
   rm -rf -- "$cache" "$worktree_parent"
 }
@@ -51,7 +79,13 @@ while IFS=$'\t' read -r public_case_id case_id base_ref diff_file; do
   git -C "$cache" fetch --no-tags --depth=1 upstream "$base_ref:$upstream_ref"
   git -C "$cache" worktree add --detach "$worktree" "$upstream_ref"
 
-  if ! grep -q '^diff --git a/\.github/workflows/' "$patch"; then
+  if grep -q '^diff --git a/\.github/workflows/' "$patch"; then
+    # Preserve workflow files that are part of the business patch, while making
+    # every upstream workflow dispatch-only on both sides of the evaluation PR.
+    # The fixed CodeQL workflow is attached later and remains the sole
+    # pull_request-triggered workflow.
+    disable_upstream_workflow_triggers
+  else
     rm -rf -- "$worktree/.github/workflows"
   fi
   rm -f -- "$worktree/.coderabbit.yaml"
